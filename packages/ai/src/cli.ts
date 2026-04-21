@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-
+import "dotenv/config";
 import { createInterface } from "node:readline";
 import { existsSync, readFileSync, writeFileSync } from "fs";
 import { getOAuthProvider, getOAuthProviders } from "./utils/oauth/index.js";
