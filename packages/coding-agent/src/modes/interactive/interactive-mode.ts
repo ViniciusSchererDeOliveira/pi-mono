@@ -8,7 +8,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import type { AssistantMessage, ImageContent, Message, Model, OAuthProviderId } from "@mariozechner/pi-ai";
+import {
+	type AssistantMessage,
+	getProviders,
+	type ImageContent,
+	type Message,
+	type Model,
+	type OAuthProviderId,
+} from "@mariozechner/pi-ai";
 import type {
 	AutocompleteItem,
 	AutocompleteProvider,
@@ -45,6 +52,7 @@ import {
 	getAgentDir,
 	getAuthPath,
 	getDebugLogPath,
+	getDocsPath,
 	getShareViewerUrl,
 	getUpdateInstruction,
 	VERSION,
@@ -154,7 +162,7 @@ type CompactionQueuedMessage = {
 };
 
 const ANTHROPIC_SUBSCRIPTION_AUTH_WARNING =
-	"Anthropic subscription auth is active. Third-party usage now draws from extra usage and is billed per token, not your Claude plan limits. Manage extra usage at https://claude.ai/settings/usage.";
+	"Anthropic subscription auth is active. Third-party harness usage draws from extra usage and is billed per token, not your Claude plan limits. Manage extra usage at https://claude.ai/settings/usage.";
 
 function isAnthropicSubscriptionAuthKey(apiKey: string | undefined): boolean {
 	return typeof apiKey === "string" && apiKey.startsWith("sk-ant-oat");
@@ -168,9 +176,14 @@ function hasDefaultModelProvider(providerId: string): providerId is keyof typeof
 	return providerId in defaultModelPerProvider;
 }
 
-const API_KEY_PROVIDER_NAMES: Record<string, string> = {
+const BEDROCK_PROVIDER_ID = "amazon-bedrock";
+
+const API_KEY_LOGIN_PROVIDERS: Record<string, string> = {
+	anthropic: "Anthropic",
+	[BEDROCK_PROVIDER_ID]: "Amazon Bedrock",
 	"azure-openai-responses": "Azure OpenAI Responses",
 	cerebras: "Cerebras",
+	deepseek: "DeepSeek",
 	fireworks: "Fireworks",
 	google: "Google Gemini",
 	"google-vertex": "Google Vertex AI",
@@ -189,10 +202,25 @@ const API_KEY_PROVIDER_NAMES: Record<string, string> = {
 	zai: "ZAI",
 };
 
-const API_KEY_LOGIN_PROVIDER_BLOCKLIST = new Set(["amazon-bedrock", "llama.cpp", "lmstudio", "ollama"]);
+const BUILT_IN_API_KEY_LOGIN_PROVIDERS = new Set(Object.keys(API_KEY_LOGIN_PROVIDERS));
+const BUILT_IN_MODEL_PROVIDERS = new Set<string>(getProviders());
 
-function getApiKeyProviderDisplayName(providerId: string): string {
-	return API_KEY_PROVIDER_NAMES[providerId] ?? providerId;
+export function isApiKeyLoginProvider(
+	providerId: string,
+	oauthProviderIds: ReadonlySet<string>,
+	builtInProviderIds: ReadonlySet<string> = BUILT_IN_MODEL_PROVIDERS,
+): boolean {
+	if (BUILT_IN_API_KEY_LOGIN_PROVIDERS.has(providerId)) {
+		return true;
+	}
+	if (builtInProviderIds.has(providerId)) {
+		return false;
+	}
+	return !oauthProviderIds.has(providerId);
+}
+
+export function getApiKeyProviderDisplayName(providerId: string): string {
+	return API_KEY_LOGIN_PROVIDERS[providerId] ?? providerId;
 }
 
 /**
@@ -234,6 +262,7 @@ export class InteractiveMode {
 	private onInputCallback?: (text: string) => void;
 	private loadingAnimation: Loader | undefined = undefined;
 	private workingMessage: string | undefined = undefined;
+	private workingVisible = true;
 	private workingIndicatorOptions: LoaderIndicatorOptions | undefined = undefined;
 	private readonly defaultWorkingMessage = "Working...";
 	private readonly defaultHiddenThinkingLabel = "Thinking...";
@@ -255,9 +284,6 @@ export class InteractiveMode {
 
 	// Tool execution tracking: toolCallId -> component
 	private pendingTools = new Map<string, ToolExecutionComponent>();
-
-	// Track first user message to avoid leading spacer at top of chat
-	private isFirstUserMessage = true;
 
 	// Tool output expansion state
 	private toolOutputExpanded = false;
@@ -339,6 +365,9 @@ export class InteractiveMode {
 		private options: InteractiveModeOptions = {},
 	) {
 		this.runtimeHost = runtimeHost;
+		this.runtimeHost.setBeforeSessionInvalidate(() => {
+			this.resetExtensionUI();
+		});
 		this.runtimeHost.setRebindSession(async () => {
 			await this.rebindCurrentSession();
 		});
@@ -910,6 +939,12 @@ export class InteractiveMode {
 		return result;
 	}
 
+	private formatExtensionDisplayPath(path: string): string {
+		let result = this.formatDisplayPath(path);
+		result = result.replace(/\/index\.ts$/, "").replace(/\/index\.js$/, "");
+		return result;
+	}
+
 	private formatContextPath(p: string): string {
 		const cwd = path.resolve(this.sessionManager.getCwd());
 		const absolutePath = path.isAbsolute(p) ? path.resolve(p) : path.resolve(cwd, p);
@@ -1044,11 +1079,18 @@ export class InteractiveMode {
 
 	private getCompactExtensionLabels(extensions: Array<{ path: string; sourceInfo?: SourceInfo }>): string[] {
 		const nonPackageExtensions = extensions
-			.map((extension) => ({
-				path: extension.path,
-				sourceInfo: extension.sourceInfo,
-				segments: this.getCompactDisplayPathSegments(extension.path),
-			}))
+			.map((extension) => {
+				const segments = this.getCompactDisplayPathSegments(extension.path);
+				const lastSegment = segments[segments.length - 1];
+				if (segments.length > 1 && (lastSegment === "index.ts" || lastSegment === "index.js")) {
+					segments.pop();
+				}
+				return {
+					path: extension.path,
+					sourceInfo: extension.sourceInfo,
+					segments,
+				};
+			})
 			.filter((extension) => !this.isPackageSource(extension.sourceInfo));
 
 		return extensions.map((extension) => {
@@ -1373,8 +1415,9 @@ export class InteractiveMode {
 			if (extensions.length > 0) {
 				const groups = this.buildScopeGroups(extensions);
 				const extList = this.formatScopeGroups(groups, {
-					formatPath: (item) => this.formatDisplayPath(item.path),
-					formatPackagePath: (item) => this.getShortPath(item.path, item.sourceInfo),
+					formatPath: (item) => this.formatExtensionDisplayPath(item.path),
+					formatPackagePath: (item) =>
+						this.formatExtensionDisplayPath(this.getShortPath(item.path, item.sourceInfo)),
 				});
 				const extensionCompactList = formatCompactList(this.getCompactExtensionLabels(extensions));
 				addLoadedSection("Extensions", extensionCompactList, extList, "mdHeading");
@@ -1535,7 +1578,7 @@ export class InteractiveMode {
 
 		const extensionRunner = this.session.extensionRunner;
 		this.setupExtensionShortcuts(extensionRunner);
-		this.showLoadedResources({ force: false });
+		this.showLoadedResources({ force: false, showDiagnosticsWhenQuiet: true });
 		this.showStartupNoticesIfNeeded();
 	}
 
@@ -1557,7 +1600,6 @@ export class InteractiveMode {
 	}
 
 	private async rebindCurrentSession(): Promise<void> {
-		this.resetExtensionUI();
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
 		this.applyRuntimeSettings();
@@ -1651,6 +1693,43 @@ export class InteractiveMode {
 	 */
 	private setExtensionStatus(key: string, text: string | undefined): void {
 		this.footerDataProvider.setExtensionStatus(key, text);
+		this.ui.requestRender();
+	}
+
+	private getWorkingLoaderMessage(): string {
+		return this.workingMessage ?? this.defaultWorkingMessage;
+	}
+
+	private createWorkingLoader(): Loader {
+		return new Loader(
+			this.ui,
+			(spinner) => theme.fg("accent", spinner),
+			(text) => theme.fg("muted", text),
+			this.getWorkingLoaderMessage(),
+			this.workingIndicatorOptions,
+		);
+	}
+
+	private stopWorkingLoader(): void {
+		if (this.loadingAnimation) {
+			this.loadingAnimation.stop();
+			this.loadingAnimation = undefined;
+		}
+		this.statusContainer.clear();
+	}
+
+	private setWorkingVisible(visible: boolean): void {
+		this.workingVisible = visible;
+		if (!visible) {
+			this.stopWorkingLoader();
+			this.ui.requestRender();
+			return;
+		}
+		if (this.session.isStreaming && !this.loadingAnimation) {
+			this.statusContainer.clear();
+			this.loadingAnimation = this.createWorkingLoader();
+			this.statusContainer.addChild(this.loadingAnimation);
+		}
 		this.ui.requestRender();
 	}
 
@@ -1753,6 +1832,7 @@ export class InteractiveMode {
 		this.defaultEditor.onExtensionShortcut = undefined;
 		this.updateTerminalTitle();
 		this.workingMessage = undefined;
+		this.workingVisible = true;
 		this.setWorkingIndicator();
 		if (this.loadingAnimation) {
 			this.loadingAnimation.setMessage(`${this.defaultWorkingMessage} (${keyText("app.interrupt")} to interrupt)`);
@@ -1905,15 +1985,10 @@ export class InteractiveMode {
 			setWorkingMessage: (message) => {
 				this.workingMessage = message;
 				if (this.loadingAnimation) {
-					if (message) {
-						this.loadingAnimation.setMessage(message);
-					} else {
-						this.loadingAnimation.setMessage(
-							`${this.defaultWorkingMessage} (${keyText("app.interrupt")} to interrupt)`,
-						);
-					}
+					this.loadingAnimation.setMessage(message ?? this.defaultWorkingMessage);
 				}
 			},
+			setWorkingVisible: (visible) => this.setWorkingVisible(visible),
 			setWorkingIndicator: (options) => this.setWorkingIndicator(options),
 			setHiddenThinkingLabel: (label) => this.setHiddenThinkingLabel(label),
 			setWidget: (key, content, options) => this.setExtensionWidget(key, content, options),
@@ -2314,7 +2389,7 @@ export class InteractiveMode {
 		// Set up handlers on defaultEditor - they use this.editor for text access
 		// so they work correctly regardless of which editor is active
 		this.defaultEditor.onEscape = () => {
-			if (this.loadingAnimation) {
+			if (this.session.isStreaming) {
 				this.restoreQueuedMessagesToEditor({ abort: true });
 			} else if (this.session.isBashRunning) {
 				this.session.abortBash();
@@ -2611,18 +2686,11 @@ export class InteractiveMode {
 					this.retryLoader.stop();
 					this.retryLoader = undefined;
 				}
-				if (this.loadingAnimation) {
-					this.loadingAnimation.stop();
+				this.stopWorkingLoader();
+				if (this.workingVisible) {
+					this.loadingAnimation = this.createWorkingLoader();
+					this.statusContainer.addChild(this.loadingAnimation);
 				}
-				this.statusContainer.clear();
-				this.loadingAnimation = new Loader(
-					this.ui,
-					(spinner) => theme.fg("accent", spinner),
-					(text) => theme.fg("muted", text),
-					this.workingMessage || this.defaultWorkingMessage,
-					this.workingIndicatorOptions,
-				);
-				this.statusContainer.addChild(this.loadingAnimation);
 				this.ui.requestRender();
 				break;
 
@@ -2996,7 +3064,7 @@ export class InteractiveMode {
 			case "user": {
 				const textContent = this.getUserMessageText(message);
 				if (textContent) {
-					if (!this.isFirstUserMessage) {
+					if (this.chatContainer.children.length > 0) {
 						this.chatContainer.addChild(new Spacer(1));
 					}
 					const skillBlock = parseSkillBlock(textContent);
@@ -3020,7 +3088,6 @@ export class InteractiveMode {
 						const userComponent = new UserMessageComponent(textContent, this.getMarkdownThemeWithSettings());
 						this.chatContainer.addChild(userComponent);
 					}
-					this.isFirstUserMessage = false;
 					if (options?.populateHistory) {
 						this.editor.addToHistory?.(textContent);
 					}
@@ -3058,7 +3125,6 @@ export class InteractiveMode {
 		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
 	): void {
 		this.pendingTools.clear();
-		this.isFirstUserMessage = true;
 
 		if (options.updateFooter) {
 			this.footer.invalidate();
@@ -3174,7 +3240,8 @@ export class InteractiveMode {
 
 	/**
 	 * Gracefully shutdown the agent.
-	 * Emits shutdown event to extensions, then exits.
+	 * Stops the TUI before emitting shutdown events so extension UI cleanup cannot
+	 * repaint the final frame while the process is exiting.
 	 */
 	private isShuttingDown = false;
 
@@ -3182,17 +3249,13 @@ export class InteractiveMode {
 		if (this.isShuttingDown) return;
 		this.isShuttingDown = true;
 		this.unregisterSignalHandlers();
-		await this.runtimeHost.dispose();
-
-		// Wait for any pending renders to complete
-		// requestRender() uses process.nextTick(), so we wait one tick
-		await new Promise((resolve) => process.nextTick(resolve));
 
 		// Drain any in-flight Kitty key release events before stopping.
 		// This prevents escape sequences from leaking to the parent shell over slow SSH.
 		await this.ui.terminal.drainInput(1000);
 
 		this.stop();
+		await this.runtimeHost.dispose();
 		process.exit(0);
 	}
 
@@ -3945,7 +4008,7 @@ export class InteractiveMode {
 				},
 				() => {
 					done();
-					this.showLoginAuthTypeSelector();
+					this.ui.requestRender();
 				},
 				initialSearchInput,
 			);
@@ -4310,7 +4373,7 @@ export class InteractiveMode {
 
 		const modelProviders = new Set(this.session.modelRegistry.getAll().map((model) => model.provider));
 		for (const providerId of modelProviders) {
-			if (oauthProviderIds.has(providerId) || API_KEY_LOGIN_PROVIDER_BLOCKLIST.has(providerId)) {
+			if (!isApiKeyLoginProvider(providerId, oauthProviderIds)) {
 				continue;
 			}
 			options.push({
@@ -4392,6 +4455,8 @@ export class InteractiveMode {
 
 					if (providerOption.authType === "oauth") {
 						await this.showLoginDialog(providerOption.id, providerOption.name);
+					} else if (providerOption.id === BEDROCK_PROVIDER_ID) {
+						this.showBedrockSetupDialog(providerOption.id, providerOption.name);
 					} else {
 						await this.showApiKeyLoginDialog(providerOption.id, providerOption.name);
 					}
@@ -4400,6 +4465,7 @@ export class InteractiveMode {
 					done();
 					this.showLoginAuthTypeSelector();
 				},
+				(providerId) => this.session.modelRegistry.getProviderAuthStatus(providerId),
 			);
 			return { component: selector, focus: selector };
 		});
@@ -4413,7 +4479,9 @@ export class InteractiveMode {
 
 		const providerOptions = this.getLogoutProviderOptions();
 		if (providerOptions.length === 0) {
-			this.showStatus("No providers logged in. Use /login first.");
+			this.showStatus(
+				"No stored credentials to remove. /logout only removes credentials saved by /login; environment variables and models.json config are unchanged.",
+			);
 			return;
 		}
 
@@ -4437,7 +4505,7 @@ export class InteractiveMode {
 						const message =
 							providerOption.authType === "oauth"
 								? `Logged out of ${providerOption.name}`
-								: `Removed API key for ${providerOption.name}`;
+								: `Removed stored API key for ${providerOption.name}. Environment variables and models.json config are unchanged.`;
 						this.showStatus(message);
 					} catch (error: unknown) {
 						this.showError(`Logout failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -4503,6 +4571,34 @@ export class InteractiveMode {
 				void this.maybeWarnAboutAnthropicSubscriptionAuth();
 			}
 		}
+	}
+
+	private showBedrockSetupDialog(providerId: string, providerName: string): void {
+		const restoreEditor = () => {
+			this.editorContainer.clear();
+			this.editorContainer.addChild(this.editor);
+			this.ui.setFocus(this.editor);
+			this.ui.requestRender();
+		};
+
+		const dialog = new LoginDialogComponent(
+			this.ui,
+			providerId,
+			() => restoreEditor(),
+			providerName,
+			"Amazon Bedrock setup",
+		);
+		dialog.showInfo([
+			theme.fg("text", "Amazon Bedrock uses AWS credentials instead of a single API key."),
+			theme.fg("text", "Configure an AWS profile, IAM keys, bearer token, or role-based credentials."),
+			theme.fg("muted", "See:"),
+			theme.fg("accent", `  ${path.join(getDocsPath(), "providers.md")}`),
+		]);
+
+		this.editorContainer.clear();
+		this.editorContainer.addChild(dialog);
+		this.ui.setFocus(dialog);
+		this.ui.requestRender();
 	}
 
 	private async showApiKeyLoginDialog(providerId: string, providerName: string): Promise<void> {
